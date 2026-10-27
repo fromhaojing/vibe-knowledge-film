@@ -1,9 +1,12 @@
-/* vk.js — 引擎核心：一张 1920×1080 的 Canvas，每一帧都是 t 的纯函数。
+import * as THREE from './vendor/three.module.js';
+import { createSurface, createRenderer, parsePath } from './three-canvas.js';
+
+/* vk.js — Three.js WebGL 引擎：1920×1080 正交画面，每一帧都是 t 的纯函数。
  *
  *   VK.film({ dur, theme, draw(fr, t) })   →  window.seek(t) / window.END / window.SFX
  *
  * 画面分两层：底（bg：渐变、星点/尘埃、暗角）和光（L：一切内容）。
- * 出帧时 L 叠到底上，再把 L 模糊两遍用加法叠回去 —— 所有亮的东西自带辉光。
+ * 形状、宽线、渐变、图层与后期交给 Three.js；Canvas 仅用于字形和静态素材。
  * 没有任何状态跨帧保留：随机数全部按种子取，模拟全部按 t 重算，所以可以任意跳着 seek。
  */
 (function (G) {
@@ -64,25 +67,30 @@ class Frame {
     if (o.s != null) { const s = Array.isArray(o.s) ? o.s : [o.s, o.s]; x.scale(s[0], s[1]); }
     if (o.blur) x.filter = `blur(${o.blur}px)`;
     if (o.clip) { x.beginPath(); x.rect(...o.clip); x.clip(); }
-    fn(); x.restore();
+    try { return fn(); } finally { x.restore(); }
   }
   /* 先画到一张临时画布，再整体合成：一组东西一起淡入、一起虚、一起缩放时用 */
   layer(o, fn) {
     const f = this.film, S = f.tmp(), sx = S.getContext('2d'), keep = this.x;
-    sx.setTransform(1, 0, 0, 1, 0, 0); sx.clearRect(0, 0, W, H);
-    this.x = sx; fn(); this.x = keep;
-    const x = this.x; x.save();
-    x.globalAlpha *= clamp(o.a == null ? 1 : o.a);
-    if (o.add) x.globalCompositeOperation = 'lighter';
-    if (o.blur) x.filter = `blur(${o.blur}px)`;
-    if (o.s != null || o.at || o.rot) {
-      const cx = o.cx == null ? W / 2 : o.cx, cy = o.cy == null ? H / 2 : o.cy;
-      x.translate(cx + (o.at ? o.at[0] : 0), cy + (o.at ? o.at[1] : 0));
-      if (o.rot) x.rotate(o.rot);
-      if (o.s != null) x.scale(o.s, o.s);
-      x.translate(-cx, -cy);
-    }
-    x.drawImage(S, 0, 0); x.restore(); f.untmp(S);
+    try {
+      if (sx.reset) sx.reset(); else { sx.setTransform(1, 0, 0, 1, 0, 0); sx.clearRect(0, 0, W, H); }
+      this.x = sx;
+      try { fn(); } finally { this.x = keep; }
+      const x = this.x; x.save();
+      try {
+        x.globalAlpha *= clamp(o.a == null ? 1 : o.a);
+        if (o.add) x.globalCompositeOperation = 'lighter';
+        if (o.blur) x.filter = 'blur(' + o.blur + 'px)';
+        if (o.s != null || o.at || o.rot) {
+          const cx = o.cx == null ? W / 2 : o.cx, cy = o.cy == null ? H / 2 : o.cy;
+          x.translate(cx + (o.at ? o.at[0] : 0), cy + (o.at ? o.at[1] : 0));
+          if (o.rot) x.rotate(o.rot);
+          if (o.s != null) x.scale(o.s, o.s);
+          x.translate(-cx, -cy);
+        }
+        x.drawImage(S, 0, 0);
+      } finally { x.restore(); }
+    } finally { this.x = keep; f.untmp(S); }
   }
 
   /* --- 光 --- */
@@ -122,7 +130,7 @@ class Frame {
   /* 沿 poly 走到 k 处的坐标与切向 —— 给线头安一个光点用 */
   along(pts, k) { const f = clamp(k) * (pts.length - 1), i = Math.min(pts.length - 2, Math.floor(f)), r = f - i; return [lerp(pts[i][0], pts[i + 1][0], r), lerp(pts[i][1], pts[i + 1][1], r), Math.atan2(pts[i + 1][1] - pts[i][1], pts[i + 1][0] - pts[i][0])]; }
   /* SVG 路径字符串 */
-  path(d, o = {}) { const x = this.x; x.save(); if (o.add) x.globalCompositeOperation = 'lighter'; if (o.at) x.translate(o.at[0], o.at[1]); if (o.rot) x.rotate(o.rot); if (o.s != null) x.scale(o.s, o.s); const p = new Path2D(d); if (o.fill) { x.fillStyle = typeof o.fill === 'string' ? rgba(o.fill, o.a == null ? 1 : o.a) : o.fill; x.fill(p); } if (o.color) { x.lineWidth = o.w == null ? 2 : o.w; x.strokeStyle = rgba(o.color, o.a == null ? 1 : o.a); x.lineJoin = 'round'; x.lineCap = 'round'; if (o.glow) { x.shadowColor = rgba(o.color, .9); x.shadowBlur = o.glow; } x.stroke(p); } x.restore(); }
+  path(d, o = {}) { const x = this.x; x.save(); if (o.add) x.globalCompositeOperation = 'lighter'; if (o.at) x.translate(o.at[0], o.at[1]); if (o.rot) x.rotate(o.rot); if (o.s != null) x.scale(o.s, o.s); const p = parsePath(d); if (o.fill) { x.fillStyle = typeof o.fill === 'string' ? rgba(o.fill, o.a == null ? 1 : o.a) : o.fill; x.fill(p); } if (o.color) { x.lineWidth = o.w == null ? 2 : o.w; x.strokeStyle = rgba(o.color, o.a == null ? 1 : o.a); x.lineJoin = 'round'; x.lineCap = 'round'; if (o.glow) { x.shadowColor = rgba(o.color, .9); x.shadowBlur = o.glow; } x.stroke(p); } x.restore(); }
   circle(cx, cy, r, o = {}) { this.ellipse(cx, cy, r, r, o); }
   ellipse(cx, cy, rx, ry, o = {}) { if (rx <= 0 || ry <= 0) return; const x = this.x; x.save(); if (o.add) x.globalCompositeOperation = 'lighter'; x.beginPath(); x.ellipse(cx, cy, rx, ry, o.rot || 0, o.a0 == null ? 0 : o.a0, o.a1 == null ? Math.PI * 2 : o.a1); this._paint(o); x.restore(); }
   arc(cx, cy, r, a0, a1, o = {}) { this.ellipse(cx, cy, r, r, Object.assign({}, o, { a0, a1 })); }
@@ -230,53 +238,86 @@ function stars(x, t, n, k) {
 
 /* ---------- 影片 ---------- */
 function film(spec) {
-  const cv = document.getElementById('stage'); cv.width = W; cv.height = H;
-  const out = cv.getContext('2d');
-  const mk = () => { const c = document.createElement('canvas'); c.width = W; c.height = H; return c; };
-  const pool = [];
-  const F = { L: mk(), tmp: () => pool.pop() || mk(), untmp: c => pool.push(c), spec };
-  const small = document.createElement('canvas'); small.width = W / 4; small.height = H / 4; const sx = small.getContext('2d');
-  /* 胶片颗粒：几张预生成的噪声，按帧号轮换 */
-  const grains = []; { const r = rng(20261006); for (let k = 0; k < 6; k++) { const c = document.createElement('canvas'); c.width = 480; c.height = 270; const gx = c.getContext('2d'), im = gx.createImageData(480, 270); for (let i = 0; i < im.data.length; i += 4) { const v = 128 + (r() - .5) * 2 * 110; im.data[i] = im.data[i + 1] = im.data[i + 2] = v; im.data[i + 3] = 255; } gx.putImageData(im, 0, 0); grains.push(c); } }
-  const fr = new Frame(F); F.fr = fr;
-  const fps = spec.fps || 30;
-  const SFX = [];           // 音效登记：scene 里 fr.sfx(时刻, 名字, 参数) —— 只在导出事件表时收集
-  let collecting = false;
-  fr.sfx = (t, name, p) => { if (collecting) SFX.push([+t.toFixed(3), name, p || {}]); };
-  fr.theme = spec.theme || 'night';
+  if (!Number.isFinite(spec.dur) || spec.dur <= 0) throw new Error('film.dur must be a positive number');
+  if (typeof spec.draw !== 'function') throw new Error('film.draw must be a function');
+  const fps = spec.fps == null ? 30 : spec.fps;
+  if (!Number.isInteger(fps) || fps < 1 || fps > 240) throw new Error('film.fps must be an integer from 1 to 240');
+  const cv = document.getElementById('stage');
+  if (!cv) throw new Error('Missing #stage canvas');
+  const renderer = createRenderer(cv, W, H), pool = [];
+  const F = { L: createSurface(W, H), tmp: () => pool.pop() || createSurface(W, H), untmp: c => pool.push(c), spec, renderer };
+  const background = createSurface(W, H), under = createSurface(W, H), post = createSurface(W, H);
+  const fr = new Frame(F); F.fr = fr; fr.theme = spec.theme || 'night';
+  let collecting = false, collected = [], raf = 0, disposed = false;
+  const reset = surface => { const x = surface.getContext('2d'); if (x.reset) x.reset(); else { x.setTransform(1, 0, 0, 1, 0, 0); x.clearRect(0, 0, W, H); } return x; };
+  const lookAt = () => ({ bg: fr.theme, bgo: {}, bloom: spec.bloom == null ? ({ gilt: .34, flat: .12 }[fr.theme] || 1) : spec.bloom, grain: spec.grain == null ? .05 : spec.grain, under: null, post: null, scene3d: null });
+  fr.sfx = (t, name, params) => { if (collecting) collected.push([t, name, params || {}]); };
 
   function seek(t) {
-    t = Math.max(0, Math.min(spec.dur, t)); fr.t = t; fr.frame = Math.round(t * fps);
-    const L = F.L, lx = L.getContext('2d'); lx.setTransform(1, 0, 0, 1, 0, 0); lx.clearRect(0, 0, W, H); fr.x = lx;
-    const look = { bg: fr.theme, bgo: {}, bloom: spec.bloom == null ? ({ gilt: .34, flat: .12 }[fr.theme] || 1) : spec.bloom, grain: spec.grain == null ? .05 : spec.grain, post: null };   // 辉光：夜空全开，鎏金三成（实物不能发白），插画基本不要
-    fr.look = look;
-    spec.draw(fr, t);                                   // 场景可以改 fr.look（换底、调辉光）
-    out.setTransform(1, 0, 0, 1, 0, 0); out.globalCompositeOperation = 'source-over'; out.globalAlpha = 1; out.filter = 'none';
-    (BG[look.bg] || BG.night)(out, t, look.bgo);
-    if (look.under) look.under(out, t);                 // 需要画在内容之下、底之上的东西（整幅插画背景）
-    out.drawImage(L, 0, 0);
-    if (look.bloom > 0) {                               // 辉光：缩小→模糊→加法叠回，两档半径
-      sx.setTransform(1, 0, 0, 1, 0, 0); sx.clearRect(0, 0, W / 4, H / 4); sx.filter = 'blur(3px)'; sx.drawImage(L, 0, 0, W / 4, H / 4); sx.filter = 'none';
-      out.globalCompositeOperation = 'lighter'; out.globalAlpha = .42 * look.bloom; out.drawImage(small, 0, 0, W, H);
-      sx.clearRect(0, 0, W / 4, H / 4); sx.filter = 'blur(11px)'; sx.drawImage(L, 0, 0, W / 4, H / 4); sx.filter = 'none';
-      out.globalAlpha = .34 * look.bloom; out.drawImage(small, 0, 0, W, H);
-      out.globalCompositeOperation = 'source-over'; out.globalAlpha = 1;
-    }
-    if (look.post) look.post(out, t);                   // 全幅后期：闪白、染色、色差
-    if (look.grain > 0) { out.globalCompositeOperation = 'overlay'; out.globalAlpha = look.grain; out.imageSmoothingEnabled = true; out.drawImage(grains[fr.frame % grains.length], 0, 0, W, H); out.globalCompositeOperation = 'source-over'; out.globalAlpha = 1; }
+    if (disposed) throw new Error('Film has been disposed');
+    if (!Number.isFinite(t)) throw new Error('seek(t) requires a finite time');
+    t = clamp(t, 0, spec.dur); fr.t = t; fr.frame = Math.round(t * fps);
+    fr.x = reset(F.L); fr.look = lookAt();
+    spec.draw(fr, t);
+    const look = fr.look;
+    const bx = reset(background); (BG[look.bg] || BG.night)(bx, t, look.bgo);
+    const ux = reset(under); if (look.under) look.under(ux, t);
+    const px = reset(post); if (look.post) look.post(px, t);
+    renderer.compose({ background, under, content: F.L, post, scene3d: look.scene3d, bloom: look.bloom, grain: look.grain, frame: fr.frame });
+    return t;
   }
-  /* 音效事件表：把全片每帧过一遍，只收集、不出图 */
-  function events() { SFX.length = 0; collecting = true; const keep = F.L; for (let i = 0; i <= spec.dur * fps; i++) { fr.t = i / fps; fr.frame = i; fr.x = keep.getContext('2d'); fr.look = { bgo: {} }; try { spec.draw(fr, i / fps); } catch (e) { } } collecting = false; const seen = new Set(), uniq = []; SFX.forEach(e => { const k = e[0] + e[1]; if (!seen.has(k)) { seen.add(k); uniq.push(e); } }); uniq.sort((a, b) => a[0] - b[0]); return uniq; }
 
+  function normalizeEvents(input) {
+    if (!Array.isArray(input)) throw new Error('film.events must produce an array');
+    const names = new Set(['tick','soft','chord','bloom','rise','thud','tock','stamp','shimmer','hush']);
+    const unique = new Map();
+    for (const event of input) {
+      const [time, name, params = {}] = Array.isArray(event) ? event : [event.t, event.name, event.params || {}];
+      if (!Number.isFinite(time) || time < 0 || time > spec.dur) throw new Error('Invalid sound time: ' + time);
+      if (!names.has(name)) throw new Error('Unknown sound event: ' + name);
+      if (!params || typeof params !== 'object' || Array.isArray(params)) throw new Error('Sound parameters must be an object');
+      const t = Math.round(time * 1000) / 1000;
+      const stable = Object.fromEntries(Object.entries(params).sort(([a], [b]) => a.localeCompare(b)));
+      unique.set(JSON.stringify([t, name, stable]), [t, name, stable]);
+    }
+    return Array.from(unique.values()).sort((a, b) => a[0] - b[0]);
+  }
+
+  function events() {
+    if (spec.events != null) return normalizeEvents(typeof spec.events === 'function' ? spec.events() : spec.events);
+    const prior = { t: fr.t, frame: fr.frame, x: fr.x, look: fr.look };
+    collected = []; collecting = true;
+    try {
+      for (let i = 0; i <= Math.round(spec.dur * fps); i++) {
+        fr.t = Math.min(spec.dur, i / fps); fr.frame = i; fr.x = reset(F.L); fr.look = lookAt();
+        try { spec.draw(fr, fr.t); } catch (error) { throw new Error('Sound collection failed at ' + fr.t.toFixed(3) + 's: ' + error.message, { cause: error }); }
+      }
+      return normalizeEvents(collected);
+    } finally {
+      collecting = false; collected = []; Object.assign(fr, prior);
+    }
+  }
+
+  F.dispose = () => { disposed = true; cancelAnimationFrame(raf); renderer.dispose(); };
   G.seek = seek; G.END = spec.dur; G.FPS = fps; G.events = events; G.META = spec.meta || {};
-  document.fonts.ready.then(() => Promise.all(Object.values(FONTS).map(f => document.fonts.load(`${f[0]} 40px ${f[1].split(',')[0]}`, '运A1')))).then(() => { G.READY = true; seek(+(new URLSearchParams(location.search).get('t') || 0)); });
-  /* 预览：?play 实时播，←/→ 步进 */
-  if (new URLSearchParams(location.search).has('play')) { let t0 = performance.now(); const loop = () => { seek(((performance.now() - t0) / 1000) % spec.dur); requestAnimationFrame(loop); }; document.fonts.ready.then(() => requestAnimationFrame(loop)); }
+  G.READY = false; G.FILM_ERROR = null; G.RENDERER = 'three-webgl'; G.VK_FILM = F;
+  G.renderInfo = () => ({ backend: G.RENDERER, revision: THREE.REVISION, frame: fr.frame, memory: { ...renderer.info.memory }, render: { ...renderer.info.render } });
+  const query = new URLSearchParams(location.search);
+  document.fonts.ready
+    .then(() => Promise.all(Object.values(FONTS).map(f => document.fonts.load(f[0] + ' 40px ' + f[1].split(',')[0], '运A1'))))
+    .then(() => spec.prepare ? spec.prepare(F) : null)
+    .then(() => {
+      seek(+(query.get('t') || 0)); G.READY = true;
+      if (query.has('play')) {
+        const t0 = performance.now();
+        const loop = () => { if (!disposed) { seek(((performance.now() - t0) / 1000) % spec.dur); raf = requestAnimationFrame(loop); } };
+        raf = requestAnimationFrame(loop);
+      }
+    }).catch(error => { G.FILM_ERROR = error.stack || String(error); console.error(error); });
   return F;
 }
-
 /* 一段戏：在 [a,b] 内才画，带进出包络；fn(本地时间 lt, 包络 k) */
 function scene(fr, t, a, b, fn, fin = .6, fout = .6) { if (t < a - .001 || t > b + .001) return; const k = fade(t, a, b, fin, fout); if (k <= 0) return; fr.g({ a: k }, () => fn(t - a, k)); }
 
-G.VK = { W, H, clamp, lerp, seg, smooth, ss, E, fade, hash, rng, noise1, hex, rgba, mix, film, scene, BG, FONTS, fontOf, vignette };
+G.VK = { THREE, parsePath, W, H, clamp, lerp, seg, smooth, ss, E, fade, hash, rng, noise1, hex, rgba, mix, film, scene, BG, FONTS, fontOf, vignette };
 })(window);

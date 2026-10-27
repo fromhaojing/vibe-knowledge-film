@@ -3,10 +3,10 @@
   python new_film.py <工程目录> --world C|B [--force]
 C 夜曲（抽象概念、看不见的机制）· B 寓言（心理和行为机制）。怎么选见 references/worlds.md。
 
-工程里是 index.html 和一份只能跑起来的 film.js 骨架——里面一行画面都没有。
+工程里是 ES module index.html 和一份 Three.js film.js 骨架——里面一行画面都没有。
 文案不同，屏上的东西就不同，代码也不同：每一镜照 storyboard.md 现写，不要从别的片子里搬画面。
 引擎留在 skill 目录里，由 engine/render.py 挂载。"""
-import shutil, sys
+import argparse, json, math, shutil, sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -24,9 +24,13 @@ SKELETON = """/* ★ 片名 · {name}
 const {{ W, H, clamp, lerp, seg, smooth, ss, E, fade, hash, rng, rgba, mix }} = VK;
 const K = VKit, P = K.PAL.{pal};
 
-const T = {{ end: 30 }};                                   // 关键时刻集中写在这里，挪动时只改一处
+const T = {{ end: {duration} }};                                   // 关键时刻集中写在这里，挪动时只改一处
 const SUBS = [                                             // 一句字幕一行，和分镜表对着写；{{词}} 金色，{{!词}} 红色
   // {{ a: 0.8, b: 4.2, zh: '……'{en} }},
+];
+
+const EVENTS = [ // 独立事件；使用此数组时不要同时在 draw 中登记 fr.sfx
+  // {{ t: 1.2, name: 'tick', params: {{ gain: 0.5 }} }},
 ];
 
 /* 一个场景一个函数，自己管自己的进场和退场。 */
@@ -34,7 +38,8 @@ function scene1(fr, t) {{
 }}
 
 VK.film({{
-  dur: T.end, theme: '{theme}', meta: {{ title: '' }},
+  dur: T.end, fps: {fps}, theme: '{theme}', meta: {{ title: {title} }},
+  events: EVENTS,
   draw(fr, t) {{
     scene1(fr, t);
     K.subs(fr, t, SUBS, '{subs}');                         // 字幕永远最后画，压在一切之上
@@ -43,20 +48,37 @@ VK.film({{
 }})();
 """
 
-if __name__ == "__main__":
-    a = sys.argv[1:]
-    if len(a) < 1 or a[0].startswith("-"): sys.exit(__doc__)
-    proj = Path(a[0]).resolve(); world = (a[a.index("--world") + 1] if "--world" in a else "C").upper()
-    if world not in WORLD: sys.exit("--world 只能是 C 或 B")
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('project', type=Path)
+    parser.add_argument('--world', type=str.upper, choices=WORLD, default='C')
+    parser.add_argument('--title', default='')
+    parser.add_argument('--duration', type=float, default=30.0)
+    parser.add_argument('--fps', type=int, default=30)
+    parser.add_argument('--force', action='store_true', help='Replace only index.html and film.js')
+    args = parser.parse_args(argv)
+    if not math.isfinite(args.duration) or args.duration <= 0:
+        parser.error('--duration must be a positive finite number')
+    if not 1 <= args.fps <= 240:
+        parser.error('--fps must be between 1 and 240')
+    proj = args.project.resolve()
+    existing = [p for p in (proj / 'index.html', proj / 'film.js') if p.exists()]
+    if existing and not args.force:
+        parser.error('Already exists: ' + ', '.join(str(p) for p in existing) + '; use --force to replace')
+    name, theme, subs, pal, standing = WORLD[args.world]
+    source = SKELETON.format(name=name, theme=theme, subs=subs, pal=pal, standing=standing,
+        en=", en: '……'" if args.world == 'C' else '', duration=repr(args.duration), fps=args.fps,
+        title=json.dumps(args.title, ensure_ascii=False))
     proj.mkdir(parents=True, exist_ok=True)
-    film = proj / "film.js"
-    if film.exists() and "--force" not in a: sys.exit(f"{film} 已经存在。要覆盖加 --force")
-    name, theme, subs, pal, standing = WORLD[world]
-    shutil.copy(ROOT / "engine/index.html", proj / "index.html")
-    film.write_text(SKELETON.format(name=name, theme=theme, subs=subs, pal=pal, standing=standing, en=", en: '……'" if world == "C" else ""), encoding="utf-8", newline="\n")
-    render = ROOT / "engine/render.py"
-    print(f"建好了：{proj}（{name}）\n"
-          f"  预览  python \"{render}\" \"{proj}\" --serve\n"
-          f"  拼图  python \"{render}\" \"{proj}\" --sheet 16\n"
-          f"  渲染  python \"{render}\" \"{proj}\"\n"
-          f"下一步：film.js 里现在一行画面都没有。照 storyboard.md，从最难画的那一镜写起。")
+    shutil.copyfile(ROOT / 'engine/index.html', proj / 'index.html')
+    (proj / 'film.js').write_text(source, encoding='utf-8', newline='\n')
+    render = ROOT / 'engine/render.py'
+    print(f'建好了：{proj}（{name}，Three.js）\n'
+          f'  自检  python "{render}" --doctor\n'
+          f'  预览  python "{render}" "{proj}" --serve\n'
+          f'  拼图  python "{render}" "{proj}" --sheet 16\n'
+          '下一步：照分镜表填写字幕、事件和场景；骨架没有预制画面。')
+
+
+if __name__ == '__main__':
+    main()

@@ -11,10 +11,19 @@
 事件名：tick / soft / chord / bloom / rise / thud / tock / stamp / shimmer / hush（参数 dur，秒）
 META（film.js 的 meta）：{ root: 半音偏移, noise: [[起,止,强度0..1],...], silence: [[起,止],...], drone: 0..1 }
 """
-import json, subprocess, sys
+import json, math, subprocess, sys
 from pathlib import Path
-import numpy as np
-from scipy.signal import fftconvolve, lfilter, butter
+if __package__:
+    from .render import PipelineError, atomic_output, require_ffmpeg, require_module
+else:
+    from render import PipelineError, atomic_output, require_ffmpeg, require_module
+try:
+    np = require_module("numpy")
+    signal = require_module("scipy.signal", "scipy")
+except PipelineError as exc:
+    if __name__ == "__main__": sys.exit(str(exc))
+    raise
+fftconvolve, lfilter, butter = signal.fftconvolve, signal.lfilter, signal.butter
 
 SR = 48000
 D3 = 146.83
@@ -94,10 +103,43 @@ def reverb(x, rng, t60=3.6, wet=.42):
     wetsig = np.stack([fftconvolve(x[:, c], ir[:, c])[:len(x)] for c in (0, 1)], 1)
     return x + wetsig * wet
 
-def synth(spec, bgm=False):
+def silence_windows(spec):
+    windows = list((spec.get("meta") or {}).get("silence", []))
+    windows += [(when, when + params.get("dur", 2.5))
+                for when, name, params in spec["events"] if name == "hush"]
+    for a, b in windows:
+        if not all(isinstance(v, (int, float)) and math.isfinite(v) for v in (a, b)) or b < a:
+            raise PipelineError(f"无效静音区间：{a!r}, {b!r}")
+    return windows
+
+def audio_envelope(spec, t):
+    """静音前 0.15s 收掉、结束后 0.4s 恢复，保留全片淡入淡出。"""
+    gain = np.ones_like(t)
+    for a, b in silence_windows(spec):
+        gain *= 1 - np.clip((t - a) / .15, 0, 1) * (1 - np.clip((t - b) / .4, 0, 1))
+    gain *= np.clip(t / .6, 0, 1) * np.clip((spec["end"] - t) / 1.2, 0, 1)
+    return gain
+
+def envelope_filter(spec):
+    # aeval 按采样计算；在最终混音与 loudnorm 后使用，BGM 也能彻底静音。
+    end = spec["end"]
+    terms = ["clip(t/0.6,0,1)", f"clip(({end:.12g}-t)/1.2,0,1)"]
+    for a, b in silence_windows(spec):
+        terms.append(f"(1-clip((t-({a:.12g}))/0.15,0,1)*(1-clip((t-({b:.12g}))/0.4,0,1)))")
+    gain = "*".join(terms)
+    return f"aeval=exprs='val(0)*({gain})|val(1)*({gain})':c=stereo"
+
+def mix_filter(spec, bgm_db=-8):
+    end = spec["end"]
+    fade = min(1.5, end)
+    return (f"[2:a]atrim=0:{end},volume={bgm_db}dB,afade=t=in:d=0.4,"
+            f"afade=t=out:st={max(0, end - fade)}:d={fade}[b];"
+            "[1:a][b]amix=inputs=2:normalize=0,loudnorm=I=-14:TP=-1.5:LRA=11,"
+            + envelope_filter(spec) + "[a]")
+
+def synth(spec, bgm=False, apply_envelope=True):
     end = spec["end"]; meta = spec.get("meta") or {}; n = int((end + .05) * SR); rng = np.random.default_rng(20261006)
     dry = np.zeros((n, 2)); t = np.arange(n) / SR; root = meta.get("root", 0)
-    hush = [(when, when + p.get("dur", 2.5)) for when, name, p in spec["events"] if name == "hush"]
     for when, name, p in spec["events"]:
         if name in EV: add(dry, EV[name](rng, dict(p, root=p.get("root", 0) + root) if name in ("chord", "bloom") else p), when)
     out = reverb(dry, rng)
@@ -109,32 +151,61 @@ def synth(spec, bgm=False):
     for a, b, k in meta.get("noise", []):             # 文案说到噪声，配乐里就真的有噪声
         g = np.clip((t - a) / max(.01, b - a), 0, 1) ** 1.5 * (t <= b) * k
         out += lowpass(highpass(rng.standard_normal((n, 2)), 200), 6000) * (g * .12)[:, None]
-    g = np.ones(n)
-    for a, b in list(meta.get("silence", [])) + hush:  # 彻底静音：0.15s 收掉，0.4s 回来
-        g *= 1 - np.clip((t - a) / .15, 0, 1) * (1 - np.clip((t - b) / .4, 0, 1))
-    g *= np.clip(t / .6, 0, 1) * np.clip((end - t) / 1.2, 0, 1)
-    out *= g[:, None]
+    if apply_envelope:
+        out *= audio_envelope(spec, t)[:, None]
     return out
 
 def write_wav(path, x):
     import wave
     x = np.clip(x, -1, 1); pcm = (x * 32767).astype("<i2")
-    with wave.open(str(path), "wb") as w: w.setnchannels(2); w.setsampwidth(2); w.setframerate(SR); w.writeframes(pcm.tobytes())
+    with atomic_output(path) as tmp:
+        with wave.open(str(tmp), "wb") as w:
+            w.setnchannels(2); w.setsampwidth(2); w.setframerate(SR); w.writeframes(pcm.tobytes())
+
+def main(argv=None):
+    args = list(sys.argv[1:] if argv is None else argv)
+    if not args: print(__doc__); return 1
+    try:
+        proj = Path(args[0]).resolve()
+        spec = json.loads((proj / "audio/events.json").read_text(encoding="utf-8"))
+        end = spec["end"]
+        if not isinstance(end, (int, float)) or not math.isfinite(end) or end <= 0:
+            raise PipelineError("事件表 end 必须是有限正数。")
+        silence_windows(spec)
+        bgm = args[args.index("--bgm") + 1] if "--bgm" in args else None
+        bgm_db = -8.0
+        if bgm:
+            if not Path(bgm).is_file(): raise PipelineError(f"BGM 文件不存在：{bgm}")
+            pos = args.index("--bgm") + 2
+            if len(args) > pos and args[pos] != "--wav-only": bgm_db = float(args[pos])
+            if not math.isfinite(bgm_db): raise PipelineError("BGM 音量必须是有限数值。")
+        wav_only = "--wav-only" in args
+        raw, out = proj / "renders/raw.mp4", proj / "renders/final.mp4"
+        if not wav_only:
+            ffmpeg = require_ffmpeg()
+            if not raw.is_file(): raise PipelineError(f"缺少无声视频：{raw}；请先运行 render.py。")
+        # 外部 BGM 模式在最终混音后统一施加包络，防止事件音重复淡入淡出。
+        x = synth(spec, bgm=bool(bgm), apply_envelope=not bgm or wav_only)
+        pk = np.abs(x).max() or 1
+        x = x / pk * 10 ** (-3 / 20)
+        wav = proj / "audio/score.wav"
+        write_wav(wav, x)
+        print("score:", wav, f"{len(x) / SR:.1f}s", len(spec["events"]), "events")
+        if wav_only: return 0
+        if bgm:
+            cmd = [ffmpeg, "-v", "error", "-y", "-i", str(raw), "-i", str(wav), "-stream_loop", "-1", "-i", bgm,
+                   "-filter_complex", mix_filter(spec, bgm_db)]
+        else:
+            cmd = [ffmpeg, "-v", "error", "-y", "-i", str(raw), "-i", str(wav),
+                   "-filter_complex", "[1:a]loudnorm=I=-18:TP=-1.5:LRA=14[a]"]
+        with atomic_output(out) as tmp:
+            subprocess.run(cmd + ["-map", "0:v", "-map", "[a]", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-shortest", str(tmp)], check=True)
+        print("done", out)
+        return 0
+    except KeyboardInterrupt:
+        print("已中止，未完成输出已清理。", file=sys.stderr); return 130
+    except (PipelineError, ValueError, TypeError, KeyError, IndexError, OSError, subprocess.SubprocessError) as exc:
+        print(f"错误：{exc}", file=sys.stderr); return 1
 
 if __name__ == "__main__":
-    a = sys.argv[1:]
-    if not a: sys.exit(__doc__)
-    proj = Path(a[0]).resolve(); spec = json.load(open(proj / "audio/events.json", encoding="utf-8"))
-    bgm = a[a.index("--bgm") + 1] if "--bgm" in a else None
-    bgm_db = float(a[a.index("--bgm") + 2]) if bgm and len(a) > a.index("--bgm") + 2 and a[a.index("--bgm") + 2].lstrip("-").replace(".", "").isdigit() else -8
-    x = synth(spec, bgm=bool(bgm)); pk = np.abs(x).max() or 1; x = x / pk * 10 ** (-3 / 20)
-    wav = proj / "audio/score.wav"; write_wav(wav, x); print("score:", wav, f"{len(x) / SR:.1f}s", len(spec["events"]), "events")
-    if "--wav-only" in a: sys.exit()
-    raw, out, end = proj / "renders/raw.mp4", proj / "renders/final.mp4", spec["end"]
-    if bgm:   # 现成配乐：垫底 + 事件音；整体到 -14 LUFS
-        fc = f"[2:a]atrim=0:{end},volume={bgm_db}dB,afade=t=in:d=0.4,afade=t=out:st={end - 1.5}:d=1.5[b];[1:a][b]amix=inputs=2:normalize=0,loudnorm=I=-14:TP=-1.5:LRA=11[a]"
-        cmd = ["ffmpeg", "-v", "error", "-y", "-i", str(raw), "-i", str(wav), "-stream_loop", "-1", "-i", bgm, "-filter_complex", fc]
-    else:     # 合成配乐本来就安静、动态大：只到 -18 LUFS，别压扁
-        cmd = ["ffmpeg", "-v", "error", "-y", "-i", str(raw), "-i", str(wav), "-filter_complex", "[1:a]loudnorm=I=-18:TP=-1.5:LRA=14[a]"]
-    subprocess.run(cmd + ["-map", "0:v", "-map", "[a]", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-shortest", str(out)], check=True)
-    print("done", out)
+    sys.exit(main())

@@ -1,14 +1,10 @@
 # vibe-knowledge-film
 
-你一定见过这种视频。最近抖音上爆火的 Vibe 知识大赏，看完收获满满。
+把选题或文案制作成无旁白的横屏知识短片。Agent 研究事实、设计字幕和分镜、编写动画工程，再用浏览器逐帧渲染为 MP4。成片质量取决于讲解设计和样片复核；Skill 提供制作规范、引擎和检查工具。
 
-这种视频到底怎么做？我做了一个 skill，可以一键生成这种类型的视频。成片在下面。
+提供两套外观：C「夜曲」适合抽象概念和机制，B「寓言」适合心理、行为和生活场景。通用字幕、绘图和转场组件可以复用，具体故事与画面根据题材设计。
 
-这个 skill 有两种模式。一个叫「夜曲」，适合讲底层、难懂的知识。另一个叫「寓言」，适合把心理、行为这类逻辑，直观地演给观众看。这两种是我拆了市面上几条爆款之后，总结出来的两种热门画风。
-
-用的时候，直接把写好的文案或者一个选题丢给它。内容确认之后再生成视频。它会自己选对应的画风，写字幕稿，排分镜表，最后建对应的代码工程。先给你一段 30 秒左右的样片，确认清楚才做全片。音效它会配上，BGM 可以自己加。
-
-原理不复杂。用 Canvas 和 JavaScript 把每一帧画出来，驱动浏览器一帧一帧截图，压成视频，再混上声音。字体都是开源的。说白了，就是用代码做这样一条视频。
+当前主渲染使用 **Three.js WebGLRenderer + 正交相机**。原有 `VK` / `Frame` 绘图接口由 GPU 兼容画笔执行，Canvas 只用于小型字形或静态素材纹理；需要空间关系时也可使用原生 Three.js 场景。`seek(t)` 按绝对时间生成每一帧，Playwright 截帧、ffmpeg 编码，最后混合事件音和可选配乐。
 
 ## 夜曲：《折叠》
 
@@ -22,30 +18,71 @@
 
 ![鸽子的迷信](examples/pigeon_B.gif)
 
-## 安装
+以上 GIF 是原有示例预览；修改引擎后以重新渲染的检查结果为准。
 
-把这个目录放到 Agent 的 skill 目录，文件夹名保持 `vibe-knowledge-film`。Claude Code 的常见位置是 `~/.claude/skills/vibe-knowledge-film`。交给 Agent 的流程在 `SKILL.md`。
+## 本地使用
+
+先在仓库目录运行环境检查：
+
+```bash
+python engine/render.py --doctor
+```
+
+已在 Python 3.12 验证。运行需要 Python 依赖、本机 Google Chrome、ffmpeg、字体和支持 WebGL 的浏览器环境。自定义 Chrome 路径可设置 `VK_CHROME_EXECUTABLE`。根据检查结果准备缺失项；检查命令不自动安装依赖。
+
+需要安装时，由你或已获安装授权的 Agent 执行：
 
 ```bash
 pip install -r requirements.txt
-python -m playwright install
 python engine/get_fonts.py
 ```
 
-还需要本机已经安装的 Google Chrome 和 ffmpeg。渲染脚本打开的是本机 Chrome。字体是 SIL Open Font License，不放进仓库，所以要先跑一次 `get_fonts.py`。
+渲染使用本机 Chrome，不需要另外下载 Playwright 浏览器。字体下载需要网络；字体按各自的 SIL Open Font License 使用。
 
-在你自己的项目里建工程，不要建在这个 skill 目录里。
+Three.js **0.186.1** 和 SVGLoader 固定在 `engine/vendor/`，页面从本地服务加载，不访问 CDN；应保留随附的第三方许可说明。无须将整个动态画面绘制到 Canvas 再上传纹理。
+
+在自己的项目目录建立工程：
 
 ```bash
 python scripts/new_film.py <工程目录> --world C
 python engine/render.py <工程目录> --serve
+python engine/render.py <工程目录> --sheet 16
+python engine/render.py <工程目录> --clip 0 30 head
 ```
 
-`--world` 用 `C`（夜曲）或 `B`（寓言）。命令和写法见 `references/engine.md`。
+`--world` 可选 `C`（夜曲）或 `B`（寓言）。先检查代表性镜头和样片，通过后再渲染全片：
+
+```bash
+python engine/render.py <工程目录> --det
+python engine/render.py <工程目录> --jobs 4
+python engine/render.py <工程目录> --events
+python engine/audio.py <工程目录>
+```
+
+`renders/raw.mp4` 是无声画面，`renders/final.mp4` 是合片。音效推荐集中声明为 `EVENTS` 数组并通过 `events: EVENTS` 导出；异步资源可由 `prepare` 准备，准备完成且首帧成功后才就绪。原生 Three.js 场景示例见 `examples/three_native/`。完整命令、ES module 加载方式和 API 见 [references/engine.md](references/engine.md)。
+
+## 验证修改
+
+准备好本地依赖和字体后运行：
+
+```bash
+python -m unittest discover -s tests -p "test_*.py" -v
+python tests/browser_semantics.py
+```
+
+单测覆盖渲染失败、原子输出、进程清理、音频静音和工程创建；浏览器测试覆盖现有示例跳帧、GPU 绘图语义及资源稳定性。测试不会安装 Skill。
+
+## 作为 Skill 使用
+
+将目录放入所用 Agent 的 Skill 目录，文件夹名保持 `vibe-knowledge-film`。例如 Claude Code 常见路径为 `~/.claude/skills/vibe-knowledge-film`。安装位置依宿主而定，完整工作流在 [SKILL.md](SKILL.md)。
+
+给 Agent 一个选题、文案或现有视频工程。它应先检查环境，再建立来源可追溯的事实表和分镜，用静帧及样片判断主体、动作、字幕和讲解是否清楚。用户已要求直接制作时，无须因固定流程等待多轮确认；有明确阶段审核要求时遵守该要求。
+
+修改工程和安装 Skill 是不同操作；制作请求不会自动安装、上传或发布。依赖或渲染失败时保留诊断和工程，修复后继续。
 
 ## 许可
 
-引擎、脚本和文档里的方法说明使用 MIT 许可，见 `LICENSE`。
+引擎、脚本和文档里的方法说明使用 MIT 许可，见 [LICENSE](LICENSE)。Three.js 等第三方依赖遵循各自许可。
 
 `references/analysis.md`、`references/prompts.md` 里按成片填好的 brief，以及 `examples/stim_B`、`info_C`，字幕和画面设计来自他人的短片，版权属于原作者。这两段是学习对照，不要当成自己的作品发布。
 

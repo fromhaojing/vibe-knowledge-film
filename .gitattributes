@@ -1,0 +1,2 @@
+# Keep upstream distribution bytes intact; hashes are recorded in manifest.json.
+engine/vendor/** -whitespace linguist-vendored

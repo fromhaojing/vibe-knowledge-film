@@ -134,14 +134,20 @@ function titleGilt(fr, lt, o) {
 const _dustCache = {};
 function dustPoints(str, cx, cy, o) {
   const key = [str, cx, cy, o.font, o.size, o.track, o.n].join('|'); if (_dustCache[key]) return _dustCache[key];
-  const c = document.createElement('canvas'); c.width = W; c.height = H; const x = c.getContext('2d', { willReadFrequently: true });
-  x.font = G.VK.fontOf(o.font, o.size); x.letterSpacing = (o.track || 0) + 'px'; x.textBaseline = 'middle'; x.textAlign = 'left'; x.fillStyle = '#fff';
-  const w = x.measureText(str).width - (o.track || 0); x.fillText(str, cx - w / 2, cy);
-  const x0 = Math.max(0, Math.floor(cx - w / 2 - 10)), y0 = Math.max(0, Math.floor(cy - o.size * .75)), ww = Math.min(W - x0, Math.ceil(w + 20)), hh = Math.min(H - y0, Math.ceil(o.size * 1.5));
-  const d = x.getImageData(x0, y0, ww, hh).data, pts = [], st = o.step || 2;
+  // Rasterize only the text's bounding box; the visible frame remains entirely WebGL.
+  const c = document.createElement('canvas'), x = c.getContext('2d', { willReadFrequently: true });
+  const font = G.VK.fontOf(o.font, o.size), spacing = (o.track || 0) + 'px';
+  x.font = font; x.letterSpacing = spacing;
+  const w = x.measureText(str).width - (o.track || 0);
+  const x0 = Math.max(0, Math.floor(cx - w / 2 - 10)), y0 = Math.max(0, Math.floor(cy - o.size * .75));
+  const ww = Math.max(1, Math.min(W - x0, Math.ceil(w + 20))), hh = Math.max(1, Math.min(H - y0, Math.ceil(o.size * 1.5)));
+  c.width = ww; c.height = hh;
+  x.font = font; x.letterSpacing = spacing; x.textBaseline = 'middle'; x.textAlign = 'left'; x.fillStyle = '#fff';
+  x.fillText(str, cx - w / 2 - x0, cy - y0);
+  const d = x.getImageData(0, 0, ww, hh).data, pts = [], st = o.step || 2;
   for (let yy = 0; yy < hh; yy += st) for (let xx = 0; xx < ww; xx += st) if (d[(yy * ww + xx) * 4 + 3] > 110) pts.push([x0 + xx, y0 + yy]);
   const r = rng(4242); for (let i = pts.length - 1; i > 0; i--) { const j = Math.floor(r() * (i + 1)); [pts[i], pts[j]] = [pts[j], pts[i]]; }
-  const out = pts.slice(0, o.n || 4200).map(p => { const ang = r() * 6.2832, dist = 30 + r() * r() * 420; return { x: p[0], y: p[1], sx: p[0] + Math.cos(ang) * dist * 1.7, sy: p[1] + Math.sin(ang) * dist * .75, d: r() * .5, tw: r() }; });   // 起点就在字的周围：先是一团雾，再收成笔画
+  const out = pts.slice(0, o.n || 4200).map(p => { const ang = r() * 6.2832, dist = 30 + r() * r() * 420; return { x: p[0], y: p[1], sx: p[0] + Math.cos(ang) * dist * 1.7, sy: p[1] + Math.sin(ang) * dist * .75, d: r() * .5, tw: r() }; });
   return (_dustCache[key] = out);
 }
 function dustText(fr, str, cx, cy, o, k, t) {
@@ -278,12 +284,9 @@ function ripple(fr, t, t0, cx, cy, o = {}) { const k = seg(t, t0, t0 + (o.dur ||
 /* 泛黄旧片（B 讲"当年"的段落）：k 0..1。泛黄 + 椭圆暗角 + 片门抖动（整幅每隔一两秒横跳十几个像素，停几帧再回去）。
  * 它立刻作用在"已经画好的东西"上：先画场景，再调它，然后才画仪表和字幕 —— 这样仪表的红和字幕的白不会被染黄。o.weave === false 关掉抖动 */
 function sepia(fr, k, o = {}) {
-  if (k <= 0) return; const x = fr.x, g = Math.floor(fr.frame / 4); x.save(); x.setTransform(1, 0, 0, 1, 0, 0); x.globalAlpha = 1;
-  if (o.weave !== false && hash(g * 7.13) > .86) x.drawImage(x.canvas, Math.round((hash(g * 3.7) - .5) * 28 * k), Math.round((hash(g * 5.1) - .5) * 8 * k));
-  x.globalCompositeOperation = 'color'; x.fillStyle = rgba('#8C7550', k * .82); x.fillRect(0, 0, W, H);
-  x.globalCompositeOperation = 'multiply'; x.fillStyle = rgba('#C9B38A', k * .35); x.fillRect(0, 0, W, H); x.globalCompositeOperation = 'source-over';
-  x.translate(W / 2, H / 2); x.scale(1, H / W); const v = x.createRadialGradient(0, 0, W * .43, 0, 0, W * .72); v.addColorStop(0, rgba('#1E1408', 0)); v.addColorStop(1, rgba('#1E1408', .72 * k)); x.fillStyle = v; x.fillRect(-W, -W, W * 2, W * 2);
-  x.restore();
+  if (k <= 0) return;
+  const g = Math.floor(fr.frame / 4), jump = o.weave !== false && hash(g * 7.13) > .86;
+  fr.x.effect('sepia', { k: clamp(k), dx: jump ? Math.round((hash(g * 3.7) - .5) * 28 * k) : 0, dy: jump ? Math.round((hash(g * 5.1) - .5) * 8 * k) : 0 });
 }
 /* 噪点：文案说到噪声时，画面真的变吵。k 0..1；按帧号取随机，seek 到哪一帧都一样 */
 function noiseOverlay(fr, k, colors = ['#E84B75', '#64B8F6', '#FFFFFF']) { if (k <= 0) return; const f = fr.frame; _post(fr, x => { const r = rng(9173 + f * 31), n = Math.round(4200 * k); x.globalCompositeOperation = 'lighter'; for (let i = 0; i < n; i++) { x.fillStyle = rgba(colors[i % colors.length], .25 + r() * .55 * k); x.fillRect(r() * W, r() * H, 2 + r() * 4, 1.5 + r() * 2); } x.globalCompositeOperation = 'source-over'; }); }
